@@ -1,0 +1,675 @@
+---
+title: "Austin Animal Shelter Data - Occasion"
+---
+
+``` {r, loadLib,  warning = F, include=F}
+library(tidyverse) #Load tidyverse 
+library(gridExtra) # Load gridExtra
+library(boot) # for cv.glm()
+library(plotROC) # for ROC curve
+library(pROC) # for roc() fn
+library(zoo) # for seasons fn
+library(randomForest) # random forest functions
+library(caret) # for confusion matrix
+library(scales) # for confusion matrix
+```
+
+```{r, echo=FALSE}
+#install.packages("randomForest")
+#install.packages("zoo")
+#install.packages(plotROC) # for ROC curve
+#install.packages(pROC) # for roc() fn
+#install.packages("caret", dependencies = TRUE) # run, then reset r studio
+```
+
+
+```{r set_seed_jun, echo=FALSE}
+# for reproducing numbers
+set.seed(167)
+```
+
+
+``` {r, theData, warning= F, collapse=T,echo = FALSE}
+cats <- read_csv("/Users/junhernandez/Documents/A\ -\ Current\ Quarter/Stat167/Final\ Project/cats.csv") # Read in the .csv file
+glimpse(cats)
+nrow(cats) # Number of Rows
+ncol(cats) # Number of Columns
+```
+
+
+***
+
+### The effects of Occasion
+
+**During what time of the year are adoption rates the highest? When are they the lowest? Do these concide with specific months, holidays, or seasons?**
+
+Finding adoption trends with the respect to the time period could potentially serve as valuable data for animal shelters who need to plan adoption events.  Should these events be
+
++ Planned around specific seasons: Do more adoptions take place in the Winter, Fall, Summer,or Spring?
+
++ Organized in certain months: Does the holiday atmosphere of November and December have an effect on adoptions?
+
++ Held on a specific weekday: What day of the week is the most common day for adoption? Do most adoptions occur during the weekend, or the weekday?
+
+The `lubridate` package may once again be very useful as it can parse the variables into a date centric format, but the current `outcome_month`, `outcome_hour` and `outcome_weekday` variables are formatted nicely for filtering and grouping purposes.
+
+As an example, here is the data for all the adopted cats being grouped by the day. The number of adoptions by day can then be tallied using the `group_by` and `summary` dyplr functions. 
+``` {r, byWeekday_occ, echo = FALSE}
+# Count number of adoptions by weekday
+cats_day <- cats %>%
+  filter(outcome_type == "Adoption") %>%
+  group_by(outcome_weekday) %>% 
+  summarise( numAdoptions = n() )
+cats_day
+
+```
+
+The data can the be used for further analyzation, such as determining if the adoption rates by weekday are signifcantly different using a goodness of fit test.
+
+
+```{r, reorder_occ, echo=F}
+# Reorder the weekdays to override alphabetization
+cats_day$outcome_weekday <- factor(cats_day$outcome_weekday, levels= c( "Monday", 
+    "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+cats_day[order(cats_day$outcome_weekday), ]
+```
+
+
+**An initial visualization based on the questions we asked, is plotting the number of adoptions by weekday.**
+```{r, weekdaysGraph_occ, echo=F}
+# plot number of adoptions vs weekday
+g1 <- ggplot(data = cats_day, mapping = aes(x = outcome_weekday, y = numAdoptions)) +
+  geom_bar( stat = "identity", aes(fill = outcome_weekday)) +
+  labs(x = "Day of the Week", y = "Number of Adoptions", title = "Number of Adoptions by Weekday") +
+  theme(legend.position="none") +
+  coord_flip()
+# same plot with polar axis
+g2 <- ggplot(data = cats_day, mapping = aes(x = outcome_weekday, y = numAdoptions)) +
+  geom_bar( stat = "identity", aes(fill = outcome_weekday)) +
+  coord_polar() +
+  labs(x = "Day of the Week", y = "Number of Adoptions", title = "Number of Adoptions by Weekday") +
+  theme(legend.position="none") +
+  theme(
+  axis.text.y = element_blank(),
+  axis.ticks = element_blank()) 
+# place graphs side by side
+gridExtra::grid.arrange(g1, g2, ncol = 2)
+
+```
+We can see from the graphs that Saturday and Sunday have the highest number of adoptions. We can explore this further, and conduct statistical tests to see how much of a difference there is between the weekdays. 
+
+We start by setting up our data for EDA based on occasion, by selecting the related occasion variables, and using feature engineering to find new variables that would be helpful in initial modeling for adoption. We will conduct EDA on the set up data to see what interesting points we can learn from the data, where it leads and what questions we can come up with.
+
+**Setting up new datasets for EDA:**
+```{r setup_cats_select_occ, echo=FALSE}
+# select all vars relating to occasion
+cats_select <- cats %>%
+  select(datetime, outcome_subtype, outcome_type, outcome_month, outcome_year, outcome_weekday, outcome_hour)
+```
+
+Here, we are feature engineering a season variable, to better look at how seasons affect adoptions.
+```{r make_cats_fixed_occ,echo=TRUE}
+# mutates in outcome date per month
+cats_fixed <- cats_select %>% 
+  mutate(outcome_date = format(as.Date(cats$datetime,format="%m/%d/%Y"), "%d")) 
+
+# adds in season column to cats_fixed
+yq <- as.yearqtr(as.yearmon(cats_fixed$datetime, "%m/%d/%Y") + 1/12) # use zoo fn as.yearmon
+cats_fixed$Season <- factor(format(yq, "%q"), levels = 1:4, 
+                labels = c("Winter", "Spring", "Summer", "Fall"))
+# output
+cats_fixed
+```
+
+```{r cats_adopted_occ, echo=FALSE}
+# filters only adopted cats
+cats_adopted <- cats_fixed %>%
+  filter(outcome_type == "Adoption") 
+```
+
+From what we know, events are a great way of bringing in more adopters and spreading awareness for shelter activities. Doing some research online, I brought in outside data for events held throughout the year. I can partition the events to only include the relevant years for our data. The data can be found here: https://do512.com/venues/austin-animal-center/past_events
+
+```{r create_events_occ, echo=TRUE}
+# create table of events
+events <- tribble(
+  ~event, ~event_date, ~event_month, ~event_day,  # format of tibble
+  #--|--|--/----
+  "Hot Summer, cool seniors adoption event", "8/24/2013", 8, as.character(24),
+  "Act of Kindness with Princess B Unique", "1/18/2014", 1, as.character(18),
+  "Service project at Austin animal shelter","8/9/2014", 8, as.character(9),
+  "Austin Pittie Limits", "9/27/2014", 9, as.character(27)
+)
+# output
+events
+
+# add season column for events
+yq <- as.yearqtr(as.yearmon(events$event_date, "%m/%d/%Y") + 1/12)
+events$event_Season <- factor(format(yq, "%q"), levels = 1:4, 
+                labels = c("Winter", "Spring", "Summer", "Fall"))
+# output
+events
+```
+I have created a new table with the event name, date, month, and season. These are the four events that were relevant to the data. For 2014, an event was held throughout each season, except for spring. Next, we will join the outside events data with our main cats dataset.
+
+```{r join_events_occ, echo=FALSE}
+# join events with cats_fixed main data
+cats_fixed <- cats_fixed %>%
+  left_join(events, by = c("outcome_month" = "event_month", "outcome_date" = "event_day")) 
+```
+
+```{r, echo=FALSE}
+# test output
+#cats_fixed
+```
+
+
+```{r create_events_binary_occ, echo=TRUE}
+# add in bool column for if a date has an even
+cats_fixed <- cats_fixed %>%
+  mutate(has_event = !(is.na(event))) 
+# turn into 0/1 value
+cats_fixed$has_event <- as.integer(as.logical(cats_fixed$has_event))
+# output
+#cats_fixed
+```
+
+
+```{r, echo=FALSE}
+# test to see if date has event
+cats_fixed %>%
+  filter(outcome_month == 8, outcome_date == 24)
+```
+
+```{r, echo=FALSE}
+# filtered out 3 NA values
+cats_fixed <- cats_fixed %>%
+  filter(!(is.na(outcome_type))) 
+# output
+#cats_fixed 
+```
+Now that we have joined our outside data, cleaned and transformed our data by filtering out 3 NA values and creating a binary column for checking whether a date had an event, we are now ready to start EDA. 
+
+
+**Initial EDA on number of adoptions throughout the year:**
+```{r num_adoptions_graphs_occ, echo=FALSE}
+# bar graph of number of adoptions thoughout year
+ggplot(data = cats_adopted, mapping = aes(x = outcome_month)) +
+  geom_bar(fill = "#00BFC4") +
+  scale_x_continuous(breaks=1:12) +
+  labs(x = "Month", y = "Number of Adoptions", title = "Number of Adoptions per Month")
+
+# all data split by months, with fill by outcome_type
+ggplot(data = cats_fixed, mapping = aes(x = outcome_month)) +
+  geom_bar(aes(fill = (outcome_type == "Adoption"))) +
+  scale_x_continuous(breaks=1:12) +
+  labs(x = "Month", y = "Total Shelter Activity", title = "Adoptions vs. Non-Adoptions") +
+  labs(fill = "Adopted")
+
+# split by proportion
+ggplot(data = cats_fixed, mapping = aes(x = outcome_month, y = ..prop..)) +
+  geom_bar(aes(fill = outcome_type)) +
+  scale_x_continuous(breaks=1:12)  
+# why is there so much NA type in August? Should we clean this month's data?
+```
+What variables attribute to whether or not a cat is adopted? We can build a regression model and infer the significance of the variables. 
+
+   Based on the plots, we see that adoptions make up a good amount of total shelter activity. We also see that the data shows a large spike in adoption numbers for the second half of the year. It's very noticable that July has the highest number of adoptions for the year. We can continue EDA by focusing on July.
+
+
+**More exploration on July:**
+```{r july_casestudy_occ, echo=FALSE}
+# case study on July
+adopted_july <- cats_adopted %>%
+  filter(outcome_month == 7) 
+# keep order for graphs
+level_order <- factor(adopted_july$outcome_weekday, level = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+# Saturday has the most adoptions
+ggplot(data = adopted_july, mapping = aes(x = level_order)) +
+  geom_bar(aes(fill = outcome_weekday)) +
+  labs(x = "Day of the Week", y = "Number of Adoptions", title = "Number of Adoptions by Weekday for July") +
+  theme(legend.position="none") 
+# output
+#adopted_july
+
+```
+We see that Saturday has by far the highest number of adoptions. We recognize these patterns from the previous graphs. We can check these differences with statistical testing. 
+
+**Conduct goodness of fit test to check whether proportions are equal. ** Assumptions are satisfied since there is a large sample size, and the variables in question are categorical. 
+```{r weekdays_gof_occ, echo=FALSE}
+# Summarize adoptions by weekdays
+weekdays_test <- cats_fixed %>%
+  group_by(outcome_weekday) %>%
+  summarise(count = n()) %>%
+  arrange(match(outcome_weekday, c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
+weekdays_test
+
+# GoF test on weekdays
+res <- chisq.test(weekdays_test$count, p = c(1/7, 1/7, 1/7,1/7,1/7,1/7,1/7))
+# Access to the GoF values
+res$expected
+res$observed
+res$stdres
+# output
+res
+```
+Based on the results of the Goodness of Fit test, Saturday is highly above average, and Sunday and Tuesday are above average. Monday, Wednesday, and Friday are below average, with Thursday very below average. This falls in line with our graphs, and we can see so far that weekdays play an important role in adoption numbers.
+
+   Next, we shift our focus to looking at adoptions for the entire year, starting with seasons.
+
+**General look at adoption numbers for the whole year.**
+```{r yearly_eda_occ, echo=FALSE}
+# look at overall seasons and adoption counts
+ggplot(data = cats_fixed, mapping = aes(x = Season)) +
+  geom_bar(aes(fill = Season)) +
+  labs(x = "Season", y = "Number of Adoptions", title = "Adoptions per Season")
+
+# graphs for daily adoption numbers
+ggplot(data = cats_adopted, mapping = aes(x = outcome_date)) +
+  geom_bar(aes(fill = Season), show.legend = TRUE) +
+  facet_wrap(~ outcome_month) +
+  theme(
+  axis.text.x = element_blank(),
+  axis.ticks = element_blank()) +
+  labs(x = "Month", y = "Number of Adoptions", title = "Adoptions for the Year")
+# adoption count goes up after May
+```
+We see from the first graph that Summer and Fall are the busiest seasons. Looking at the second graph, it shows again that the second half of the year has overall higher adoptions than the first half of the year. 
+
+   Now let's look at averages for shelter adoptions for the year.
+
+**EDA on averages for adoptions:**
+```{r find_avgs_occ, echo=FALSE}
+# tests
+#dim(cats_adopted)
+#sum(nrow(cats_adopted))
+
+# find avg adoptions in general over the year
+avg_adoptions_month <- nrow(cats_adopted) / 12
+avg_adoptions_month
+
+avg_adoptions_day <- nrow(cats_adopted) / 365
+avg_adoptions_day
+```
+The data shows that the average number of adoptions per month is 1,061, and the average number of adoptions per day is about 35. We can plot the adoptions average per day against the total number of adoptions for the day, to see the distribution of above average days and below average days.
+
+**Graphing averages vs daily adoptions:**
+```{r avg_adoptions_graph_occ, echo=FALSE}
+# shows for all days when adoption counts per day were higher than avg adoptions per day
+cats_adopted %>%
+  group_by(outcome_month, outcome_date) %>%
+  summarise(count = n(),
+            avg_adopt = (count / avg_adoptions_month),  # find way to use this 
+            higher_avg = (count > avg_adoptions_day)) %>%  # bool for higher than avg adoptions
+   ggplot(mapping = aes(x = outcome_date, y = count)) +
+   geom_bar(stat = "identity", aes(fill = (higher_avg)), show.legend = TRUE) +
+   facet_wrap(~ outcome_month) + 
+  theme(
+  axis.text.x = element_blank(),  # gets rid of ticks and x-axis
+  axis.ticks = element_blank()) +
+  labs(x = "Month", y = "Number of Adoptions", title = "Adoptions for the Year") +
+  labs(fill = "Higher than average")
+```
+In this plot, we see the sharp difference between the first half and the second half of the year more pronounced. We notice that February through May had only a handful of days that were above the average amount of daily adoptions for the year. Based on these graphs, we can recommend focusing efforts on earlier months, for bringing up adoption numbers. Now, we can explore how events played a role in adoption numbers. 
+
+**Analysing events impact on adoption counts:**
+```{r, echo=FALSE}
+# test output
+events
+```
+
+```{r event_case_study_occ, echo=FALSE}
+# case study on events
+# first event 1/18/2014
+adopted_january <- cats_adopted %>%
+  filter(outcome_month == 1) 
+
+adopted_january %>%
+  group_by(outcome_month, outcome_date) %>%
+  summarise(count = n(),
+            higher_avg = (count > avg_adoptions_day)) %>%
+   ggplot(mapping = aes(x = outcome_date, y = count)) +
+   geom_bar(stat = "identity", aes(fill = (higher_avg)), show.legend = TRUE) +  
+   facet_wrap(~ outcome_month)
+
+# 2nd event 8/9/14 Saturday
+adopted_august <- cats_adopted %>%
+  filter(outcome_month == 8) 
+
+g1 <- adopted_august %>%
+  group_by(outcome_month, outcome_date) %>%
+  summarise(count = n(),
+            avg_adopt = (count / avg_adoptions_month),  
+            higher_avg = (count > avg_adoptions_day)) %>%
+   ggplot(mapping = aes(x = outcome_date, y = count)) +
+   geom_bar(stat = "identity", aes(fill = (higher_avg)), show.legend = TRUE) +
+   facet_wrap(~ outcome_month) +
+  labs(x = "Day", y = "Number of Adoptions", title = "Adoptions for August") +
+  labs(fill = "Higher than average")
+
+# 2nd event 8/9/14 w/ legend
+adopted_august <- cats_adopted %>%
+  filter(outcome_month == 8) 
+
+g2 <- adopted_august %>%
+  group_by(outcome_month, outcome_date) %>%
+  summarise(count = n(),
+            avg_adopt = (count / avg_adoptions_month),  
+            higher_avg = (count > avg_adoptions_day)) %>%
+   ggplot(mapping = aes(x = outcome_date, y = count)) +
+   geom_bar(stat = "identity", aes(fill = (higher_avg)), show.legend = TRUE) +
+   facet_wrap(~ outcome_month) +
+   scale_x_discrete(breaks= "09") +
+  labs(x = "Day", y = "Number of Adoptions") +
+  labs(fill = "Higher than average")
+
+
+# 3rd event 9/27 Saturday
+adopted_september <- cats_adopted %>%
+  filter(outcome_month == 9) 
+
+g3 <- adopted_september %>%
+  group_by(outcome_month, outcome_date) %>%
+  summarise(count = n(),
+            avg_adopt = (count / avg_adoptions_month), 
+            higher_avg = (count > avg_adoptions_day)) %>%
+   ggplot(mapping = aes(x = outcome_date, y = count)) +
+   geom_bar(stat = "identity", aes(fill = (higher_avg)), show.legend = TRUE) +
+   facet_wrap(~ outcome_month) +
+  labs(x = "Day", y = "Number of Adoptions", title = "Adoptions for September") +
+  labs(fill = "Higher than average")
+
+# 3rd event 9/27 w/ break
+adopted_september <- cats_adopted %>%
+  filter(outcome_month == 9) 
+
+g4 <- adopted_september %>%
+  group_by(outcome_month, outcome_date) %>%
+  summarise(count = n(),
+            avg_adopt = (count / avg_adoptions_month),  
+            higher_avg = (count > avg_adoptions_day)) %>%
+   ggplot(mapping = aes(x = outcome_date, y = count)) +
+   geom_bar(stat = "identity", aes(fill = (higher_avg)), show.legend = TRUE) +
+   facet_wrap(~ outcome_month) +
+   scale_x_discrete(breaks=27) +
+  labs(x = "Day", y = "Number of Adoptions") +
+  labs(fill = "Higher than average")
+
+gridExtra::grid.arrange(g1, g2)
+gridExtra::grid.arrange(g3, g4)
+```
+Comparing the average adoption count for the year, it seems that the only event that had an above average adoption count for the day was the Austin Pittie Limits event held on 9/27/2014. This was an event that coincided with a music festival, and had live events and many sponsors. It is hard to tell whether the event contributed to the higher average, due to the small sample size of events. Initial thoughts from this would be to research more on how events affect adoption rates, and whether or not it would be feasible for the shelter to host more events. 
+
+   Checking the shelter calendar for the year, it seems that the shelter has focused on hosting more events throughout the year. This could be a step in right direction, as there may be a positive impact on adoption rates from outreach.
+   
+   Now, we can use a Goodnes of Fit test to see the differences between seasons, and analyze the difference between the different parts of the year.
+
+**Conduct Goodness of Fit test on Seasons:**
+```{r season_gof_occ, echo=FALSE}
+# Summarize adoptions by Season
+season_test <- cats_fixed %>%
+  group_by(Season) %>%
+  summarise(count = n()) 
+season_test
+
+# GoF test on Season
+res <- chisq.test(season_test$count, p = c(1/4, 1/4, 1/4, 1/4))
+# Access to the GoF values
+res$expected
+res$observed
+res$stdres
+# output
+res
+```
+Based on the results of the Goodness of Fit test, the rankings for month adoptions were from greatest to least: Summer, Fall, Spring, Winter. This confirms what we saw in the previous plots, that there is a significant difference between the different parts of the year.
+
+***
+
+Initial modeling: 
+
+**Setting up new datasets for modeling:**
+```{r adoption_binary_occ, echo=FALSE}
+# Add new binary column for adoption
+cats_fixed <- cats_fixed %>%
+  mutate(adopted = (outcome_type == "Adoption")) 
+# turn into 0/1 value
+cats_fixed$adopted <- as.integer(as.logical(cats_fixed$adopted))
+# output
+#cats_fixed
+```
+
+```{r log_data_occ, echo=FALSE}
+# select vars that would be useful for creating a log model
+cats_log <- cats_fixed %>%
+  select(-outcome_subtype, -datetime, -event, -event_date, -event_Season, -outcome_type)
+# output
+#cats_log
+```
+We can set up new data sets for modeling by only selecting the variables that would be useful the model. We can eliminate datetime since we have grouped that data within other columns, among other variables that have many NA's and are already represented with other variables.
+
+   Since we are trying to see how occasion affects adoption as a binary event, we can run a logistic regression model based on the occasion features we have created: adoption date, season, whether the date has an event. 
+   
+**Logistic Model:**
+```{r log_adopted_model_occ, echo=TRUE}
+# Adopted = adoption_month + year + weekday + hour + date + season + event
+# create log reg model based on all 7 vars
+log.adopted <- glm(adopted ~ ., data = cats_log,
+                family = binomial)
+summary(log.adopted)
+```
+Our logistic model is **Adopted = adoption_month + year + weekday + hour + date + season + event**. We can see that adoption month, year, hour, and season are significant. Some adoption weekdays and dates are signicant, which is supported with our previous statistical tests. This also shows that some dates are more important than others for adoption count for the day, however, we should be careful with overfitting the model with the data. 
+
+   Unfortunately, the event variable is insignificant. This is most likely due to a very small sample size. We would need more data from recent years to see how much of an impact events have on adoptions.
+
+```{r mis_rate_adopted_occ,echo=FALSE}
+# use predict to find conditional
+log.adopted.probs <- predict(log.adopted, type = "response")
+head(log.adopted.probs)
+
+# classify the default status using Baye's condtional
+log.adopted.pred <- ifelse(log.adopted.probs > 0.5, 1, 0) %>%
+  as.factor()
+# peak at first values
+head(log.adopted.pred)
+
+# find misclassification results
+mean(cats_log$adopted != log.adopted.pred)
+```
+[1] 0.3212319
+
+```{r log_adopted_cv_occ, echo=FALSE}
+# use cv.glm to find 10-fold cv MSE
+(cv.10.err <- cv.glm(cats_log, log.adopted, K = 10)$delta)
+
+```
+[1] 0.2099641 0.2099286
+
+```{r log_model_roc_occ, echo=FALSE}
+# place fitted values in cleaned data
+cats_log$fitted_adopted <- log.adopted$fitted.values
+# use roc funnction for graphing
+ rocfit <- roc(cats_log$adopted, cats_log$fitted_adopted)
+ auc(rocfit)
+ coords(rocfit, x = "b")
+ 
+ plot(rocfit)
+```
+
+We found that the misclassification rate for our model is 0.3212319 and the 10-fold cross validation MSE is 0.2099286 unbiased. This leaves us with an accuracy of 67.9%. This initial model does not perform too well, but we can conclude that there is only so much information occasion can give overall. Although unsuccessful, this model serves good insights as a preliminary model. 
+
+
+We can also use another powerful classification model, Random Forest, to help give insights on what occasion features play a role in determining adoption.
+
+**Random forest model dataset preparation:**
+```{r cats_rf_data_occ, echo=TRUE}
+# make cats random forest data set by getting rid of columns with many NAs
+cats_rf <- cats_fixed %>%
+  select(-event ,-event_date, -event_Season, -outcome_subtype, -datetime, - outcome_type) %>%
+  mutate_if(is.character, as.factor) # RF doesn't work with char
+
+# check NA count for each column
+sapply(cats_rf, function(x) sum(is.na(x)))
+# change adopted to factor
+cats_rf$adopted <- as.character(cats_rf$adopted)
+cats_rf$adopted <- as.factor(cats_rf$adopted)
+
+```
+In order to use random forest, we must remove any columns with many NAs. Luckily, these columns are represented by other variables, so we are not losing much data. We also turn any character data in factors.
+
+We split the data into training and validation sets.
+```{r training_data_set_occ, echo=FALSE}
+# Split into Train and Validation sets
+# Training Set : Validation Set = 70 : 30 (random)
+train <- sample(nrow(cats_rf), 0.7*nrow(cats_rf), replace = FALSE)
+TrainSet <- cats_rf[train,]
+ValidSet <- cats_rf[-train,]
+TrainSet
+ValidSet
+```
+
+
+**Run Random forest model based on occasion data.**
+```{r rf_model_occ, echo=TRUE}
+# rf model to classify adopted
+rf.model <- randomForest::randomForest(adopted ~ ., data = TrainSet, importance = TRUE)
+```
+
+```{r}
+# outoput
+rf.model
+```
+
+```{r misclass_rate_rf_occ, echo=FALSE}
+# Predicting on train set
+predTrain <- predict(rf.model, TrainSet, type = "class")
+# Checking classification accuracy
+table(predTrain, TrainSet$adopted)
+
+# Predicting on Validation set
+predValid <- predict(rf.model, ValidSet, type = "class")
+# Checking classification accuracy
+mean(predValid == ValidSet$adopted)                    
+table(predValid,ValidSet$adopted)
+
+1 - mean(predValid == ValidSet$adopted)     
+```
+
+```{r varImpPlot_rf_occ, echo=FALSE}
+# To check important variables
+importance(rf.model)        
+varImpPlot(rf.model, main = "Importance of Variables") 
+```
+
+We can use the caret package to plot a confusion matrix, which will show the prediction vs reference numbers for the model.
+```{r cfm_rf_occ, echo=FALSE}
+# use cfm fn to plot confusion matrix
+cfm <- confusionMatrix(predValid, ValidSet$adopted)
+cfm
+# output accuracy of rf model
+a <- confusionMatrix(predValid, ValidSet$adopted)$overall[1]
+print(paste('Accuracy of Random Forest Model = ', a))
+
+```
+
+```{r ggplot_cfm_occ, echo=FALSE}
+# fn to help plot cfm with ggplot
+ggplotConfusionMatrix <- function(m){
+  mytitle <- paste("Confusion Matrix - ","Accuracy", percent_format()(m$overall[1]),
+                   "Kappa", percent_format()(m$overall[2]))
+  p <-
+    ggplot(data = as.data.frame(m$table) ,
+           aes(x = Reference, y = Prediction)) +
+    geom_tile(aes(fill = log(Freq)), colour = "white") +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    geom_text(aes(x = Reference, y = Prediction, label = Freq)) +
+    theme(legend.position = "none") +
+    ggtitle(mytitle)
+  return(p)
+}
+# output
+ggplotConfusionMatrix(cfm)
+```
+We can see that the random forest model, based on occasion features, performs much better, with a higher accuracy. Although more powerful, this model is harder to interpret, but we can check the overall accuracy from the confusion matrix.
+   Now that we have a model that performs better, we can tune the random forest model based on accuracy.
+   
+**Tuning random forest for mtry.**   
+```{r tuning_rf_occ, echo=TRUE}
+# Using For loop to identify the right mtry for model
+a=c()
+i=5
+for (i in 3:8) {
+  model.temp <- randomForest::randomForest(adopted ~ ., data = TrainSet, ntree = 500, mtry = i, importance = TRUE)
+  predValid <- predict(model.temp, ValidSet, type = "class")
+  a[i-2] = mean(predValid == ValidSet$adopted)  
+}
+# output
+a
+# plot
+plot(3:8,a)
+```
+
+```{r rf_mtry_table_occ, echo=FALSE, warning=FALSE}
+# make table for mtry values
+mtry.table <- tibble::as.tibble(a)
+mtry.table <- cbind(mtry.table, index = seq(nrow(mtry.table)) + 2)
+mtry.table
+```
+
+```{r plot_mtry_occ, echo=FALSE}
+# plot mtry predictors vs accuracy
+ggplot(data = mtry.table, mapping = aes(x = index, y = value)) +
+  geom_point() +
+  geom_line() + 
+  labs(x = "Predictors Considered", y = "Accuracy") # pred. considered in model algorithm
+```
+We see that the highest accuracy for the model is with 4 predictors considered. The mtry parameter is the number of variables randomly sampled as predictor candidates at each tree split. Now we can make a new model with these new parameters.
+
+**New random forest model:**
+```{r rf_model_tuned_occ, echo=TRUE}
+# rf model tuned with mtry = 4
+rf.model.tuned <- randomForest::randomForest(adopted ~ ., data = TrainSet, ntree = 500, mtry = 4, importance = TRUE)
+```
+
+```{r, echo=FALSE}
+# output
+rf.model.tuned
+```
+
+```{r misclass_rate_rf_tuned_occ, echo=FALSE}
+# Predicting on train set
+predTrain.tuned <- predict(rf.model.tuned, TrainSet, type = "class")
+# Checking classification accuracy
+table(predTrain.tuned, TrainSet$adopted)
+
+# Predicting on Validation set
+predValid.tuned <- predict(rf.model.tuned, ValidSet, type = "class")
+# Checking classification accuracy
+mean(predValid.tuned == ValidSet$adopted)                    
+table(predValid.tuned,ValidSet$adopted)
+
+1 - mean(predValid.tuned == ValidSet$adopted)     
+```
+
+```{r varImPlot_tuned_occ, echo=FALSE}
+# To check important variables
+randomForest::importance(rf.model.tuned)        
+randomForest::varImpPlot(rf.model.tuned, main = "Importance of Variables") 
+```
+
+```{r plot_cfm_tuned_occ, echo=FALSE}
+# make confusion matrix
+cfm <- confusionMatrix(predValid.tuned, ValidSet$adopted)
+cfm
+# output accuracy
+a <- confusionMatrix(predValid.tuned, ValidSet$adopted)$overall[1]
+print(paste('Accuracy of Random Forest Model = ', a))
+# plot cfm
+ggplotConfusionMatrix(cfm)
+```
+Final model accuracy: 78.6%, Out of sample error rate: 22.74%, which is similar to LOOCV. 
+
+   The chart displays the variables that affected the random forest, in order from highest to lowest. We use the Gini index for classifying node purity, whether or not the node contains observations predominantly from a single class. We see that Adoption date and hour are the two most powerful variables. 
+   
+   From this model, we have a better outlook on what occasion variables affect adoption the most, and we can use this to better tune our final overall model.
+
